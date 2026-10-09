@@ -161,3 +161,6 @@ GitHub侧也可在 Settings → Secrets 里删除该 secret，删除后 workflow
 | `AUTH_REJECTED` / HTTP 401 | token 过期或已失效 | 桌面端重新登录，再刷新 secret |
 | `PermissionError` 读登录态失败 | 在受限沙箱内运行 | 换普通终端重跑 |
 | `检测到加密凭据（sym-v1）` | 客户端升级为加密信封 | 需在客户端内解密，当前脚本不支持 |
+| `[Errno 101] Network is unreachable` | GitHub runner 无 IPv6 路由 | 脚本已强制走 IPv4 并自动降级 587；仍失败则换用 163 或其他邮箱 |
+| `(535) Authentication failed` | 授权码错误，或 SMTP 服务未开启 | 检查邮箱设置里是否已开启 SMTP，授权码是否为最新生成 |
+| `未配置 MAIL_HOST/MAIL_USER` | 邮件 secret 没建 | 重新按步骤 3 配置 |
