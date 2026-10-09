@@ -1,0 +1,87 @@
+name: Buddy加油站每日签到 + 微信通知
+
+on:
+  schedule:
+    # 每天 00:05 跑一次主任务（UTC），北京时间 = UTC+8，即 08:05。
+    # GitHub cron 用 UTC，这里有意避开整点，减少共享 runner 排队高峰。
+    - cron: '5 16 * * *'
+    # 每 4 小时轮询一次。理由（来自上游项目的实测结论）：
+    #   · Buddy 旅行 1~4 小时后带礼物回来，礼物必须手动领，
+    #     只靠每天一次会把礼物压到第二天才到账；
+    #   · 旅行每日只有一个派出名额，当天没派成会整个浪费掉；
+    #   · 轮询同时会先查签到状态，未签才补 —— 接口幂等，已签则只是查询。
+    # 00:05 那次负责当天首次签到，这几次负责及时领礼物 + 补签 + 补派。
+    - cron: '5 0,4,8,12,20 * * *'
+  workflow_dispatch: # 允许手动触发，便于验证
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一时间只允许一个实例，避免重复领取
+  group: wb-daily-signin
+  cancel-in-progress: false
+
+jobs:
+  signin:
+    name: 签到 + 猫猫旅行 + 微信推送
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        id: py
+        # 解释器路径不写死版本号：用系统 python3 动态取
+        run: |
+          set -euo pipefail
+          PY="$(command -v python3)"
+          echo "使用解释器: $PY"
+          echo "版本: $($PY --version)"
+          echo "py_path=$PY" >> "$GITHUB_OUTPUT"
+
+      - name: 从 secret 还原登录态
+        # secret 内为 base64 编码的 session JSON；解密后写入临时文件。
+        # 权限收紧 + 任务结束自动清理，明文不落仓库、不进日志。
+        env:
+          WB_AUTH_B64: ${{ secrets.WB_AUTH_FILE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WB_AUTH_B64}" ]; then
+            echo "::error::未配置 secret WB_AUTH_FILE。请在本机运行 scripts/refresh_secret.py 注入。"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$WB_AUTH_B64" | base64 -d > "$RUNNER_TEMP/workbuddy-auth.json"
+          echo "已还原登录态（内容不回显）"
+
+      - name: 执行签到与猫猫旅行
+        env:
+          WORKBUDDY_AUTH_FILE: ${{ runner.temp }}/workbuddy-auth.json
+          # 轮询时默认静默：只有真的领到东西或签到异常才推送，避免一天打扰 5 次。
+          # 主任务（北京时间 00:05 那次）始终推送。
+          WB_QUIET: ${{ github.event_name == 'schedule' && !(contains(github.event.schedule, '5 16 * * *')) && '1' || '0' }}
+          # 微信推送通道：四选一即可，都没配则只打印内容不推送。
+          # 个人微信无官方推送接口，任一通道都是经中间服务转发到你的微信。
+          WECHAT_WORK_WEBHOOK: ${{ secrets.WECHAT_WORK_WEBHOOK }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          WXPUSHER_APPTOKEN: ${{ secrets.WXPUSHER_APPTOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+        run: |
+          set -euo pipefail
+          "${{ steps.py.outputs.py_path }}" scripts/run_daily.py
+
+      - name: 上传原始返回
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signin-raw-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 7
+
+      - name: 清理
+        if: always()
+        run: rm -f "$RUNNER_TEMP/workbuddy-auth.json"

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+artifacts/
+# 登录态与任何凭证绝不入库
+*.info
+workbuddy-desktop.info
+signin.log
