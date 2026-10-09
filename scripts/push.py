@@ -25,6 +25,7 @@ import json
 import os
 import re
 import smtplib
+import socket
 import ssl
 import sys
 from email.message import EmailMessage
@@ -184,9 +185,14 @@ def send_email(title, content):
     云端 runner 连的是公共 SMTP，不存在本机安全软件拦截，因此不需要
     任何本地端口放行。关键是用授权码：QQ/163 需在邮箱设置里开启 SMTP
     服务并生成授权码；Gmail 需开两步验证并建 App Password。
+
+    GitHub runner 的两个坑已在此处处理：
+      1. IPv6：托管 runner 会解析到 IPv6 但容器内无 IPv6 路由，
+         直接连会报 [Errno 101] Network is unreachable —— 故强制走 IPv4。
+      2. 端口：465 在部分 runner 上不可达，会自动降级到 587（STARTTLS），
+         反之亦然。两个都失败时把两个端口的真实报错一起抛出，便于定位。
     """
     host = os.environ["MAIL_HOST"].strip()
-    port = int(os.environ.get("MAIL_PORT", "465").strip())
     user = os.environ["MAIL_USER"].strip()
     password = os.environ["MAIL_PASSWORD"].strip()
     to = os.environ.get("MAIL_TO", "").strip() or user
@@ -198,14 +204,44 @@ def send_email(title, content):
     message["To"] = to
     message.set_content(f"{title}\n\n{'=' * 40}\n\n{content}\n")
 
-    # 465 用隐式 SSL；587 用 STARTTLS。两者都要显式指定，别依赖库默认。
+    # 端口优先级：配置的端口优先，其次尝试另一个。
+    # 465 = 隐式 SSL，587 = STARTTLS。GitHub runner 到465 有时被墙/不可达，
+    # 降级到 587 常常能通；反之亦然。
+    configured = os.environ.get("MAIL_PORT", "").strip()
+    if configured:
+        primary = int(configured)
+        order = [primary] + [p for p in (465, 587) if p != primary]
+    else:
+        order = [465, 587]
+
+    errors = []
+    for port in order:
+        try:
+            _smtp_send(host, port, user, password, message)
+            return True, f"已发送至 {to}（via {host}:{port}）"
+        except Exception as exc:
+            errors.append(f"{port}端口: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError("；".join(errors))
+
+
+def _smtp_send(host, port, user, password, message):
+    """按端口建立 SMTP 连接并发送。"""
+    # GitHub 托管 runner 会把主机名解析到 IPv6，但容器内没有 IPv6 路由，
+    # 导致 [Errno 101] Network is unreachable。这里强制走 IPv4。
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        if infos:
+            host = infos[0][4][0]
+    except Exception:
+        pass  # 解析失败就交给 SMTP 库自己报错
+
+    ctx = ssl.create_default_context()
     if port == 465:
-        ctx = ssl.create_default_context()
         server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
     else:
         server = smtplib.SMTP(host, port, timeout=30)
-        server.starttls(context=ssl.create_default_context())
-
+        server.starttls(context=ctx)
     try:
         server.login(user, password)
         server.send_message(message)
@@ -214,7 +250,6 @@ def send_email(title, content):
             server.quit()
         except Exception:
             pass
-    return True, f"已发送至 {to}（via {host}:{port}）"
 
 
 def dispatch(title, content):
