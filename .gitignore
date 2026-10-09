@@ -5,3 +5,6 @@ artifacts/
 *.info
 workbuddy-desktop.info
 signin.log
+# refresh_secret.py 导出的待粘贴凭证
+WB_AUTH_FILE.txt
+*.secret
