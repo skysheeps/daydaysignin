@@ -1,45 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把签到与猫猫旅行结果推送到微信相关通道。
+"""把签到与猫猫旅行结果发送到你的邮箱。
 
-重要前提
---------
-个人微信（WeChat）**没有开放的主动推送接口**，任何"推送到个人微信"的方案
-都必须经过一个中间通道。本脚本支持以下几种，按你已有的任选一个配置即可：
+需要的 secret（仓库 Settings → Secrets and variables → Actions 里配）：
+  MAIL_HOST      SMTP 服务器，如 smtp.qq.com / smtp.163.com / smtp.gmail.com
+  MAIL_PORT      端口：QQ/163 用 465（隐式 SSL），Gmail 用 587（STARTTLS）
+  MAIL_USER      发件账号（写完整地址）
+  MAIL_PASSWORD  授权码，**不是登录密码**
+  MAIL_TO        收件地址，可与发件人相同（可选，默认同 MAIL_USER）
+  MAIL_FROM_NAME 发件人显示名（可选）
 
-  1. 企业微信机器人   WECHAT_WORK_WEBHOOK   —— 配置最简单，一个地址即可，群内直接收消息
-  2. Server 酱 Turbo  SERVERCHAN_KEY       —— 通过服务号推送到你的微信，无需企业微信
-  3. PushPlus         PUSHPLUS_TOKEN       —— 微信/公众号推送
-  4. WxPusher         WXPUSHER_APPTOKEN + WXPUSHER_UID
-
-哪个 secret 存在就用哪个；都没配时只打印预览（方便排查），不影响结论。
+注意：QQ/163 需在邮箱设置中开启 SMTP 服务并生成「授权码」；
+Gmail 需开启两步验证并创建 App Password。登录密码在云端 runner 上
+基本都会被服务商拒绝，务必用授权码。
 
 行为保证（沿用原约束）
   * 签到与猫猫状态分开成区块。
   * 猫猫失败不影响签到结论，退出码只由签到决定。
   * 所有文本经 redact() 擦除凭证。
-  * 推送失败只记录日志，绝不改变业务结论。
+  * 发送失败只记录日志，绝不改变业务结论。
 """
 
 import json
 import os
 import re
+import smtplib
+import ssl
 import sys
-import urllib.parse
-import urllib.request
+from email.message import EmailMessage
 
 # 签到成功的判定：上游把结果放在 result，或放在 body.code
 # code=10001 表示"今天已签到"，属幂等成功（接口幂等，不会重复领取）
 CHECKIN_OK = {"CLAIMED", "ALREADY_CHECKED_IN", "OK", "SUCCESS"}
 CHECKIN_OK_CODES = {0, 10001}
 
-# 各通道的内容长度上限（字节），超出截断，避免被服务端拒绝
-CONTENT_LIMIT = {
-    "wechat_work": 4096,
-    "serverchan": 32000,
-    "pushplus": 32000,
-    "wxpusher": 4000,
-}
+# 邮件正文长度上限（字符），超出截断，避免被邮件服务商拒收
+CONTENT_LIMIT = {"email": 20000}
 
 
 def mask(value, keep=4):
@@ -55,7 +51,7 @@ def mask(value, keep=4):
 def redact(text):
     """对来自服务端的文本做凭证擦除。
 
-    上游 report/msg 由服务端拼装，理论上不夹带 token；但推送是外部通道，
+    上游 report/msg 由服务端拼装，理论上不夹带 token；但邮件是外部通道，
     一旦服务端异常回显完整凭证就会外泄。这里再兜一层，宁可误伤也不外泄。
     """
     if not text:
@@ -175,83 +171,61 @@ def truncate(text, limit):
     return text.encode("utf-8")[: limit - 30].decode("utf-8", "ignore") + "\n…（内容过长已截断）"
 
 
-def _post(url, data=None, json_body=None, headers=None):
-    """统一的 POST，失败只抛异常由上层兜住。"""
-    if json_body is not None:
-        body = json.dumps(json_body).encode("utf-8")
-        hdr = {"Content-Type": "application/json"}
+def send_email(title, content):
+    """通过 SMTP 发一封纯文本邮件到你的邮箱。
+
+    需要的 secret（全部在仓库 Settings → Actions 里配）：
+      MAIL_HOST      SMTP 服务器地址，如 smtp.qq.com / smtp.163.com
+      MAIL_PORT      端口，QQ/163=465，Gmail=587
+      MAIL_USER      发件账号（完整地址）
+      MAIL_PASSWORD  授权码，**不是登录密码**
+      MAIL_TO        收件地址（可与发件人相同）
+
+    云端 runner 连的是公共 SMTP，不存在本机安全软件拦截，因此不需要
+    任何本地端口放行。关键是用授权码：QQ/163 需在邮箱设置里开启 SMTP
+    服务并生成授权码；Gmail 需开两步验证并建 App Password。
+    """
+    host = os.environ["MAIL_HOST"].strip()
+    port = int(os.environ.get("MAIL_PORT", "465").strip())
+    user = os.environ["MAIL_USER"].strip()
+    password = os.environ["MAIL_PASSWORD"].strip()
+    to = os.environ.get("MAIL_TO", "").strip() or user
+    sender_name = os.environ.get("MAIL_FROM_NAME", "WorkBuddy签到助手").strip()
+
+    message = EmailMessage()
+    message["Subject"] = f"[Buddy加油站] {title}"
+    message["From"] = f"{sender_name} <{user}>"
+    message["To"] = to
+    message.set_content(f"{title}\n\n{'=' * 40}\n\n{content}\n")
+
+    # 465 用隐式 SSL；587 用 STARTTLS。两者都要显式指定，别依赖库默认。
+    if port == 465:
+        ctx = ssl.create_default_context()
+        server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
     else:
-        body = urllib.parse.urlencode(data or {}).encode("utf-8")
-        hdr = {"Content-Type": "application/x-www-form-urlencoded"}
-    if headers:
-        hdr.update(headers)
-    req = urllib.request.Request(url, data=body, headers=hdr, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return resp.status, resp.read().decode("utf-8", "replace")
+        server = smtplib.SMTP(host, port, timeout=30)
+        server.starttls(context=ssl.create_default_context())
 
-
-def push_wechat_work(webhook, title, content):
-    """企业微信群机器人：地址即含 key。"""
-    content = truncate(content, CONTENT_LIMIT["wechat_work"])
-    status, raw = _post(webhook, json_body={"msgtype": "markdown", "markdown": {"content": content}})
-    ok = status == 200 and ("errcode" in raw and '"errcode":0' in raw.replace(" ", ""))
-    return ok, f"HTTP {status} {raw[:120]}"
-
-
-def push_serverchan(key, title, content):
-    """Server 酱Turbo：推送到你的微信服务号，无需企业微信。"""
-    content = truncate(content, CONTENT_LIMIT["serverchan"])
-    status, raw = _post(
-        f"https://sctapi.ftqq.com/{urllib.parse.quote(key)}.send",
-        data={"title": title, "desp": content},
-    )
-    return status == 200, f"HTTP {status} {raw[:120]}"
-
-
-def push_pushplus(token, title, content):
-    """PushPlus：微信/公众号推送。"""
-    content = truncate(content, CONTENT_LIMIT["pushplus"])
-    status, raw = _post(
-        "https://www.pushplus.plus/send",
-        json_body={"token": token, "title": title, "content": content.replace("\n", "<br>")},
-    )
-    return status == 200 and '"code":200' in raw.replace(" ", ""), f"HTTP {status} {raw[:120]}"
-
-
-def push_wxpusher(app_token, uid, title, content):
-    """WxPusher：公众号推送，content 支持 Markdown。"""
-    content = truncate(content, CONTENT_LIMIT["wxpusher"])
-    summary = title if len(title) <= 100 else title[:100]
-    status, raw = _post(
-        "https://wxpusher.zjiecode.com/api/send/message",
-        json_body={
-            "appToken": app_token, "uid": uid,
-            "content": content, "summary": summary,
-        },
-    )
-    return status == 200 and '"code":1000' in raw.replace(" ", ""), f"HTTP {status} {raw[:120]}"
+    try:
+        server.login(user, password)
+        server.send_message(message)
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+    return True, f"已发送至 {to}（via {host}:{port}）"
 
 
 def dispatch(title, content):
-    """按已配置的 secret 自动选择通道并发送。"""
+    """按已配置的 secret 选择发送方式。"""
     attempts = []
 
-    if os.environ.get("WECHAT_WORK_WEBHOOK", "").strip():
-        attempts.append(("企业微信机器人", lambda: push_wechat_work(
-            os.environ["WECHAT_WORK_WEBHOOK"].strip(), title, content)))
-    if os.environ.get("SERVERCHAN_KEY", "").strip():
-        attempts.append(("Server酱", lambda: push_serverchan(
-            os.environ["SERVERCHAN_KEY"].strip(), title, content)))
-    if os.environ.get("PUSHPLUS_TOKEN", "").strip():
-        attempts.append(("PushPlus", lambda: push_pushplus(
-            os.environ["PUSHPLUS_TOKEN"].strip(), title, content)))
-    if os.environ.get("WXPUSHER_APPTOKEN", "").strip() and os.environ.get("WXPUSHER_UID", "").strip():
-        attempts.append(("WxPusher", lambda: push_wxpusher(
-            os.environ["WXPUSHER_APPTOKEN"].strip(),
-            os.environ["WXPUSHER_UID"].strip(), title, content)))
+    if os.environ.get("MAIL_HOST", "").strip() and os.environ.get("MAIL_USER", "").strip():
+        attempts.append(("邮件", lambda: send_email(title, content)))
 
     if not attempts:
-        print("[push] 未配置任何推送通道 secret，跳过发送。")
+        print("[push] 未配置 MAIL_HOST/MAIL_USER，跳过发送。")
         return False
 
     all_ok = True
@@ -261,7 +235,7 @@ def dispatch(title, content):
             print(f"[push] {name}: {'成功' if ok else '失败'} | {detail}")
             all_ok = all_ok and ok
         except Exception as exc:
-            # 推送失败绝不改变业务结论
+            # 发送失败绝不改变业务结论
             print(f"[push] {name}: 异常（不影响签到结论）：{exc}", file=sys.stderr)
             all_ok = False
     return all_ok
@@ -273,11 +247,11 @@ def is_truthy(name):
 
 
 def should_push(checkin, growth):
-    """决定是否值得打扰用户。
+    """决定是否值得打扰用户（决定这封邮件要不要发）。
 
-    一天跑 6 次，若每次都推送会变成骚扰。静默规则（WB_QUIET=1 时生效）：
-      · 签到失败或需要关注 → 必须推送（异常要让人知道）
-      · 本轮真的领到积分/能量 → 推送（有收益才值得看）
+    一天跑 6 次，若每次都发信会变成骚扰。静默规则（WB_QUIET=1 时生效）：
+      · 签到失败或需要关注 → 必须发信（异常要让人知道）
+      · 本轮真的领到积分/能量 → 发信（有收益才值得看）
       · 其余情况（今日已签到、旅行中、无事发生）→ 静默，只留日志
     """
     if not is_truthy("WB_QUIET"):
@@ -321,10 +295,10 @@ def main():
     print("[push] 猫猫区块已独立生成（不影响签到结论）")
 
     push_it, reason = should_push(checkin, growth)
-    print(f"[push] 推送决策：{'推送' if push_it else '静默'}（{reason}）")
+    print(f"[push] 发送决策：{'发信' if push_it else '静默'}（{reason}）")
 
-    # 无论推不推，日志都完整打印，便于排查
-    print("---- 消息内容 ----")
+    # 无论发不发，日志都完整打印，便于排查
+    print("---- 邮件内容 ----")
     print(f"{title}\n{text}")
 
     if push_it:

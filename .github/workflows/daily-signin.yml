@@ -1,4 +1,4 @@
-name: Buddy加油站每日签到 + 微信通知
+name: Buddy加油站每日签到 + 邮件通知
 
 on:
   schedule:
@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   signin:
-    name: 签到 + 猫猫旅行 + 微信推送
+    name: 签到 + 猫猫旅行 + 邮件通知
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -60,16 +60,16 @@ jobs:
       - name: 执行签到与猫猫旅行
         env:
           WORKBUDDY_AUTH_FILE: ${{ runner.temp }}/workbuddy-auth.json
-          # 轮询时默认静默：只有真的领到东西或签到异常才推送，避免一天打扰 5 次。
-          # 主任务（北京时间 00:05 那次）始终推送。
+          # 轮询时默认静默：只有真的领到东西或签到异常才发信，避免一天打扰 5 次。
+          # 主任务（北京时间 00:05 那次）始终发信。
           WB_QUIET: ${{ github.event_name == 'schedule' && !(contains(github.event.schedule, '5 16 * * *')) && '1' || '0' }}
-          # 微信推送通道：四选一即可，都没配则只打印内容不推送。
-          # 个人微信无官方推送接口，任一通道都是经中间服务转发到你的微信。
-          WECHAT_WORK_WEBHOOK: ${{ secrets.WECHAT_WORK_WEBHOOK }}
-          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          WXPUSHER_APPTOKEN: ${{ secrets.WXPUSHER_APPTOKEN }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          # 邮件通知：SMTP。注意 MAIL_PASSWORD 填「授权码」而非登录密码。
+          MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM_NAME: ${{ secrets.MAIL_FROM_NAME }}
         run: |
           set -euo pipefail
           "${{ steps.py.outputs.py_path }}" scripts/run_daily.py

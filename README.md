@@ -1,6 +1,6 @@
 # Buddy 加油站每日签到 + 猫猫旅行（GitHub Actions）
 
-用 GitHub Actions 云端定时任务完成 WorkBuddy「Buddy 加油站」的每日签到与 Buddy 旅行领取，结果推送到微信。
+用 GitHub Actions 云端定时任务完成 WorkBuddy「Buddy 加油站」的每日签到与 Buddy 旅行领取，结果发送到你的邮箱。
 
 ## 真实接口（来自 88lin/workbuddy-auto-signin + 服务端实测，非网上旧接口名）
 
@@ -67,32 +67,30 @@ token 全程经 stdin 传给 `gh secret set`，不进命令行、不落仓库。
 > ⚠️ 那行 base64 等价于你的登录凭证。粘贴完请清空终端历史（`clear`），
 > 也别把它贴到聊天、issue 或截图中。泄露后处理办法见文末。
 
-### 3. 配置微信推送（四选一）
+### 3. 配置邮件通知（SMTP）
 
-个人微信没有开放的主动推送接口，任何「推送到微信」的方案都要经过一个中间通道。脚本已内置四种，**配哪个就用哪个**，都没配则只在日志里打印内容、不推送。
+在仓库 `Settings → Secrets and variables → Actions` 里加这些 secret：
 
-| 通道 | Secret 名 | 怎么拿 |
+| Secret | 填什么 | 例子 |
 |---|---|---|
-| **企业微信机器人**（推荐） | `WECHAT_WORK_WEBHOOK` | 企业微信群 → 群设置 → 群机器人 → 添加 → 复制 Webhook 地址 |
-| **Server 酱 Turbo** | `SERVERCHAN_KEY` | 微信搜索「Server酱」公众号 → 添加后得到 SendKey |
-| **PushPlus** | `PUSHPLUS_TOKEN` | pushplus.plus 注册后拿 Token |
-| **WxPusher** | `WXPUSHER_APPTOKEN` + `WXPUSHER_UID` | wxpusher.zjiecode.com 扫码后获取 |
+| `MAIL_HOST` | SMTP 服务器地址 | `smtp.qq.com` |
+| `MAIL_PORT` | 端口，QQ/163 用 465，Gmail 用 587 | `465` |
+| `MAIL_USER` | 发件账号（写完整地址） | `12345678@qq.com` |
+| `MAIL_PASSWORD` | **授权码**，不是登录密码 | 见下方说明 |
+| `MAIL_TO` | 收件地址，可与发件人相同 | `me@qq.com` |
+| `MAIL_FROM_NAME` | 发件人显示名（可选） | `WorkBuddy签到助手` |
 
-企业微信机器人最快，配置最简单（一个地址就够），如果公司微信在用优先选它。
+**授权码怎么拿（关键）**：云端 runner 用普通登录密码基本都会被服务商拒绝，必须用授权码。
 
-设置方式（任选其一）：
+| 邮箱 | 操作路径 |
+|---|---|
+| QQ 邮箱 | 设置 → 账户 → 开启 SMTP 服务 → 生成授权码 → 复制（16 位） |
+| 163 邮箱 | 设置 → POP3/SMTP/IMAP → 开启 SMTP → 客户端授权密码 |
+| Gmail | 开启两步验证 → Google Account → App passwords → 生成 |
 
-```bash
-# 网页粘贴（无需 gh）
-# Settings → Secrets and variables → Actions → New repository secret
-#   Name: WECHAT_WORK_WEBHOOK
-#   Secret: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
+> QQ/163 的 SMTP 服务需先在邮箱设置里**手动开启**，否则发信会报认证失败。授权码只显示一次，生成后立刻保存到 secret。
 
-# 或用 gh CLI
-echo -n "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx" | gh secret set WECHAT_WORK_WEBHOOK --repo <你的账号>/<仓库名>
-```
-
-Server 酱 / PushPlus / WxPusher 只需把上表里的 Secret 换成对应名称，值填它们的 key/token 即可，代码无需改动。
+465 端口走隐式 SSL，587 走 STARTTLS，脚本会按端口自动选择，无需额外配置。
 
 ### 4. 手动触发验证
 
@@ -105,7 +103,7 @@ Actions 页签点 **Run workflow**，或在仓库 Settings → Actions 启用。
 | `signin.py` | 上游签到核心脚本（来自 88lin/workbuddy-auto-signin，MIT） |
 | `scripts/refresh_secret.py` | 本机读登录态 → 注入 GitHub secret |
 | `scripts/run_daily.py` | 云端入口，编排签到 → 猫猫 → 推送 |
-| `scripts/push.py` | 微信推送（企业微信/Server酱/PushPlus/WxPusher 四通道），分区块 + 脱敏 |
+| `scripts/push.py` | 邮件发送（SMTP），分区块 + 脱敏 |
 | `.github/workflows/daily-signin.yml` | 定时任务定义 |
 
 ## 运行频率
@@ -123,7 +121,9 @@ Actions 页签点 **Run workflow**，或在仓库 Settings → Actions 启用。
 - 真的领到积分
 - 领到旅行礼物 / 派出新一趟 / 开盲盒 / 连登奖励兑换
 
-其余情况（今日已签到、旅行中、今天名额已用完）只留 Actions 日志，不打扰。
+其余情况（今日已签到、旅行中、今天名额已用完）只留Actions 日志，不发信。
+
+> 手动触发（Run workflow）始终发信。邮件发送失败**不会**影响签到结论——两者独立判定。
 
 > 手动触发（Run workflow）始终推送，方便验证。
 > 想调整频率直接改 `.github/workflows/daily-signin.yml` 里的 cron。
