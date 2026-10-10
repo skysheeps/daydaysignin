@@ -204,15 +204,19 @@ def send_email(title, content):
     message["To"] = to
     message.set_content(f"{title}\n\n{'=' * 40}\n\n{content}\n")
 
-    # 端口优先级：配置的端口优先，其次尝试另一个。
-    # 465 = 隐式 SSL，587 = STARTTLS。GitHub runner 到465 有时被墙/不可达，
-    # 降级到 587 常常能通；反之亦然。
+    # 端口优先级：配置的端口优先，然后 465 / 587。
+    # 25 与 2525 一律跳过：那是明文提交口，GitHub 托管 runner 与多数邮箱
+    # 服务商都已禁用或强限流，用它们只会白等 30 秒超时。
     configured = os.environ.get("MAIL_PORT", "").strip()
+    order = []
     if configured:
-        primary = int(configured)
-        order = [primary] + [p for p in (465, 587) if p != primary]
-    else:
-        order = [465, 587]
+        try:
+            p = int(configured)
+            if p in (465, 587):
+                order.append(p)
+        except ValueError:
+            pass  # 端口填错就按默认顺序走，不因此中断
+    order += [p for p in (465, 587) if p not in order]
 
     errors = []
     for port in order:
@@ -226,22 +230,33 @@ def send_email(title, content):
 
 
 def _smtp_send(host, port, user, password, message):
-    """按端口建立 SMTP 连接并发送。"""
-    # GitHub 托管 runner 会把主机名解析到 IPv6，但容器内没有 IPv6 路由，
-    # 导致 [Errno 101] Network is unreachable。这里强制走 IPv4。
-    try:
-        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        if infos:
-            host = infos[0][4][0]
-    except Exception:
-        pass  # 解析失败就交给 SMTP 库自己报错
+    """按端口建立 SMTP 连接并发送。
 
+    host 必须始终传主机名，绝不能换成 IP。
+    TLS 的 SNI 与证书校验都依赖主机名：163 邮箱的证书只对 *.163.com 有效，
+    用 IP 直连必然报 "certificate is not valid for '1.2.3.4'"。
+    规避 runner 无 IPv6 路由的正确做法是「把域名解析限制为 IPv4」，
+    而不是「把主机名替换为 IP」。
+    """
     ctx = ssl.create_default_context()
-    if port == 465:
-        server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
-    else:
-        server = smtplib.SMTP(host, port, timeout=30)
-        server.starttls(context=ctx)
+
+    # 临时把 getaddrinfo 限定为 IPv4：GitHub runner 会解析到 IPv6 但容器内
+    # 没有 IPv6 路由，直连报 [Errno 101]。只改解析族，主机名保持不变。
+    original_getaddrinfo = socket.getaddrinfo
+
+    def ipv4_only(host_, port_, family=0, type=0, proto=0, flags=0):
+        return original_getaddrinfo(host_, port_, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = ipv4_only
+    try:
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
+        else:
+            server = smtplib.SMTP(host, port, timeout=30)
+            server.starttls(context=ctx)
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
     try:
         server.login(user, password)
         server.send_message(message)
