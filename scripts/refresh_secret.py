@@ -9,16 +9,19 @@
 
 前置条件：
   - 本机已登录 WorkBuddy 桌面端。
-  - 已安装 gh CLI 并完成认证（gh auth login）。
-  - 已在仓库配置好secret 名（默认 WB_AUTH_FILE）。
 
-用法：
-  python3 refresh_secret.py --repo 你名/你的仓库
+用法（推荐 --emit，无需 gh CLI）：
+  python3 refresh_secret.py --repo 你名/你的仓库 --emit      # 打印供网页粘贴
   python3 refresh_secret.py --repo 你名/你的仓库 --dry-run   # 只打印脱敏预览
+  python3 refresh_secret.py --repo 你名/你的仓库             # 需 gh CLI，直接写入
+
+重要：导出的 accessToken 有效期约 30 天，Secret 是静态快照，过期后云端
+签到必然返回 401。到期前请重跑本脚本更新 Secret `WB_AUTH_FILE`。
 """
 
 import argparse
 import base64
+import datetime
 import json
 import os
 import re
@@ -142,6 +145,20 @@ def main():
     print("[refresh] uid        :", cred["uid"])
     print("[refresh] token      :", mask(cred["accessToken"]))
     print("[refresh] enterprise  :", cred["enterpriseId"] or "<none>")
+
+    # 打印有效期，让"什么时候该再跑一次"变成看得见的数字。
+    # 只读 JWT 的 exp 声明，不输出 token 内容。
+    try:
+        segment = cred["accessToken"].split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        exp = int(json.loads(base64.urlsafe_b64decode(segment))["exp"])
+        when = datetime.datetime.fromtimestamp(exp)
+        left = round((when - datetime.datetime.now()).total_seconds() / 86400)
+        print(f"[refresh] 有效期至   : {when:%Y-%m-%d %H:%M}（剩余 {left} 天）")
+        if left <= 7:
+            print("[refresh] 注意：本机登录态临近到期，请先打开一次客户端让它续期。")
+    except Exception:
+        pass  # 非 JWT 格式时不影响导出
 
     if args.dry_run:
         print("[refresh] dry-run：未写入 secret。")

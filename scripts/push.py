@@ -21,6 +21,8 @@ Gmail 需开启两步验证并创建 App Password。登录密码在云端 runner
   * 发送失败只记录日志，绝不改变业务结论。
 """
 
+import base64
+import datetime
 import json
 import os
 import re
@@ -37,6 +39,41 @@ CHECKIN_OK_CODES = {0, 10001}
 
 # 邮件正文长度上限（字符），超出截断，避免被邮件服务商拒收
 CONTENT_LIMIT = {"email": 20000}
+
+# 凭证剩余天数低于此值时，邮件里主动提醒更新，并在静默模式下强制发信
+AUTH_WARN_DAYS = 7
+
+
+def auth_expiry():
+    """解析登录态里 accessToken 的过期时间。
+
+    WORKBUDDY_AUTH_FILE 由 run_daily.py 所在进程继承下来，指向 Actions
+    临时目录里还原出的 JSON。只读 exp 声明，绝不输出 token 本身。
+    返回 (剩余天数, 格式化过期时间)；无法解析时返回 (None, None)。
+    """
+    path = (os.environ.get("WORKBUDDY_AUTH_FILE") or "").strip()
+    if not path or not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            token = (json.load(fh).get("auth") or {}).get("accessToken") or ""
+        segment = token.split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        exp = int(json.loads(base64.urlsafe_b64decode(segment)).get("exp") or 0)
+        when = datetime.datetime.fromtimestamp(exp)
+        # 用四舍五入而非 .days 向下取整，避免"剩 3 天"显示成"剩 2 天"
+        days = round((when - datetime.datetime.now()).total_seconds() / 86400)
+        return days, when.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None, None
+
+
+def auth_rejected(checkin, growth):
+    """两段结果里只要出现认证拒绝，就说明 Secret 里的凭证已失效。"""
+    return "AUTH_REJECTED" in (
+        str(checkin.get("result", "")).upper(),
+        str(growth.get("result", "")).upper(),
+    )
 
 
 def mask(value, keep=4):
@@ -154,13 +191,42 @@ def growth_block(data):
 def build_text(checkin, growth):
     """组装消息体。两个区块用分隔线隔开，便于手机端阅读。
 
-    分隔线用全角横线而非 Markdown 的 ---，因为企业微信机器人不渲染
-    Markdown 水平分割线，会原样显示成三个减号。
+    分隔线用全角横线，邮件正文是纯文本，不会渲染 Markdown。
     """
     cb, ok = checkin_block(checkin)
     gb = growth_block(growth)
     title = "Buddy 加油站 · 每日签到"
     body = f"{cb}\n\n——————————\n\n{gb}"
+
+    days, expiry = auth_expiry()
+
+    if auth_rejected(checkin, growth):
+        # 401 的根因几乎总是 Secret 快照过期：本机客户端会自动续期，
+        # 但云端 Secret 是静态字符串，不会跟着刷新。
+        note = (
+            "**需要处理：登录凭证已失效**\n"
+            "· 原因：Secret `WB_AUTH_FILE` 里的 accessToken 已过期。"
+            "本机客户端会自动刷新登录态，但云端 Secret 是静态快照，不会同步。\n"
+        )
+        if expiry:
+            note += f"· 该凭证过期时间：{expiry}\n"
+        note += (
+            "· 修复：在本机执行 `python3 scripts/refresh_secret.py --repo "
+            "<账号>/<仓库> --emit`，把输出更新到 Secret `WB_AUTH_FILE`。\n"
+            "· 该凭证有效期约 30 天，建议到期前主动刷新一次。"
+        )
+        body += f"\n\n——————————\n\n{note}"
+    elif days is not None and days <= AUTH_WARN_DAYS:
+        # 提前预警：在签到还没坏之前就发信，避免静默模式把它吞掉。
+        note = (
+            "**提醒：登录凭证即将到期**\n"
+            f"· accessToken 将于 {expiry} 过期（剩余 {days} 天）。\n"
+            "· 到期后签到会返回 HTTP 401；请提前运行 "
+            "`refresh_secret.py --emit` 更新 Secret `WB_AUTH_FILE`。"
+        )
+        body += f"\n\n——————————\n\n{note}"
+        title += " · 凭证待更新"
+
     return title, body, ok
 
 
@@ -301,11 +367,18 @@ def should_push(checkin, growth):
 
     一天跑 6 次，若每次都发信会变成骚扰。静默规则（WB_QUIET=1 时生效）：
       · 签到失败或需要关注 → 必须发信（异常要让人知道）
+      · 凭证失效或即将到期 → 必须发信（需要人工去刷新，不能被静默吞掉）
       · 本轮真的领到积分/能量 → 发信（有收益才值得看）
       · 其余情况（今日已签到、旅行中、无事发生）→ 静默，只留日志
     """
     if not is_truthy("WB_QUIET"):
         return True, "非静默模式"
+
+    if auth_rejected(checkin, growth):
+        return True, "认证失败，需要更新凭证"
+    days, _ = auth_expiry()
+    if days is not None and days <= AUTH_WARN_DAYS:
+        return True, f"凭证剩余 {days} 天到期，提醒更新"
 
     if not is_checkin_ok(checkin):
         return True, "签到失败，需要关注"

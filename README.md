@@ -64,6 +64,19 @@ python3 scripts/refresh_secret.py --repo <你的账号>/<仓库名> --dry-run
 写入的 secret 名为 `WB_AUTH_FILE`，内容是 base64 封装的 session JSON。
 token 全程经 stdin 传给 `gh secret set`，不进命令行、不落仓库。
 
+> ### ⏰ 这一步每 30 天要做一次（最容易踩的坑）
+>
+> Secret 里存的是 **accessToken 的静态快照，不是自动续期的凭据**。本机桌面端会自动
+> 刷新登录态，但云端 Secret 不会跟着变。JWT 的 `exp` 实测有效期约 30 天，过期后
+> 签到和猫猫旅行会**同时返回 HTTP 401**。
+>
+> - `--dry-run` / `--emit` 现在会打印 `有效期至 YYYY-MM-DD（剩余 N 天）`，照着它安排。
+> - 剩余 ≤7 天时，脚本会在邮件里追加「凭证即将到期」提醒，且**静默模式下也强制发信**。
+> - 真过期了：重新打开一次桌面端让它续期 → 重跑 `--emit` → 覆盖 `WB_AUTH_FILE`。
+>
+> 实测案例：2026-10-09 导出的凭证 `exp=2026-11-06`，11-07 起连续漏签 3 天，
+> 直到重新导出才恢复。
+
 > ⚠️ 那行 base64 等价于你的登录凭证。粘贴完请清空终端历史（`clear`），
 > 也别把它贴到聊天、issue 或截图中。泄露后处理办法见文末。
 
@@ -158,7 +171,7 @@ GitHub侧也可在 Settings → Secrets 里删除该 secret，删除后 workflow
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `未配置 secret WB_AUTH_FILE` | secret 没建或名字拼错 | 重新按步骤 2 建secret |
-| `AUTH_REJECTED` / HTTP 401 | token 过期或已失效 | 桌面端重新登录，再刷新 secret |
+| `AUTH_REJECTED` / HTTP 401（签到与猫猫**同时**失败） | Secret 里的 accessToken 已过期（约 30 天有效期），不是账号问题 | 打开一次桌面端让它续期 → `refresh_secret.py --emit` → 覆盖 `WB_AUTH_FILE`。邮件里会直接给出过期时间 |
 | `PermissionError` 读登录态失败 | 在受限沙箱内运行 | 换普通终端重跑 |
 | `检测到加密凭据（sym-v1）` | 客户端升级为加密信封 | 需在客户端内解密，当前脚本不支持 |
 | `[Errno 101] Network is unreachable` | GitHub runner 无 IPv6 路由 | 脚本已强制走 IPv4 解析；仍失败则换邮箱服务商 |
